@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PCAP 비교 분석기</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="./wasm_exec.js"></script>
+    <script src="./vue.global.js"></script>
+    <script src="./base64-binary.js"></script>
+    <script src="./main.js"></script>
+</head>
+<body>
+<div id="app" class="container">
+    <h1>PCAP 패킷 비교 분석기</h1>
+
+    <div class="file-inputs">
+        <div class="file-input">
+            <label for="fileA">첫 번째 PCAP 파일 (A):</label>
+            <input type="file" id="fileA" accept=".pcap,.pcapng" @change="handleFileAChange">
+        </div>
+        <div class="file-input">
+            <label for="fileB">두 번째 PCAP 파일 (B):</label>
+            <input type="file" id="fileB" accept=".pcap,.pcapng" @change="handleFileBChange">
+        </div>
+    </div>
+
+    <button @click="analyzePcaps" class="analyze-btn" :disabled="!fileA || !fileB">분석하기</button>
+
+    <div v-if="error" class="error-message">
+        {{ error }}
+    </div>
+
+    <div v-if="analyzing" id="analyzing">
+        <p class="analyzing-text">분석 중입니다. 잠시만 기다려주세요...</p>
+        <div class="loader"></div>
+    </div>
+
+    <div v-if="results" id="results">
+        <h2>분석 결과</h2>
+
+        <div class="result-section">
+            <div>
+                count a : {{ results.countA }}
+            </div>
+            <div>
+                count b : {{ results.countB }}
+            </div>
+        </div>
+
+        <div class="accordion result-section">
+            <div class="accordion-header" @click="toggleSection('dropped')">
+                <h3>A에는 있지만 B에는 없는 패킷 ({{ results.dropped.length }}개)</h3>
+                <span class="accordion-icon">{{ sectionOpen.dropped ? '▼' : '▶' }}</span>
+            </div>
+            <div class="accordion-content" v-if="sectionOpen.dropped">
+                <div class="pagination-controls" v-if="results.dropped.length > 0">
+                    <button @click="changePage('dropped', currentPage.dropped - 1)"
+                            :disabled="currentPage.dropped === 1">이전</button>
+                    <span>{{ currentPage.dropped }} / {{ totalPages.dropped }}</span>
+                    <button @click="changePage('dropped', currentPage.dropped + 1)"
+                            :disabled="currentPage.dropped === totalPages.dropped">다음</button>
+                </div>
+                <ul class="packet-list">
+                    <li v-for="packet in paginatedItems.dropped" :key="packet.id">
+                        패킷 #{{ packet.id }}: <span class="proto">{{ packet.protocol }}</span>,
+                        길이: {{ packet.length }}, 시간: {{ packet.timestamp }}
+                        info: {{ packet.info }}
+                    </li>
+                </ul>
+            </div>
+        </div>
+
+        <div class="accordion result-section">
+            <div class="accordion-header" @click="toggleSection('inserted')">
+                <h3>B에는 있지만 A에는 없는 패킷 ({{ results.inserted.length }}개)</h3>
+                <span class="accordion-icon">{{ sectionOpen.inserted ? '▼' : '▶' }}</span>
+            </div>
+            <div class="accordion-content" v-if="sectionOpen.inserted">
+                <div class="pagination-controls" v-if="results.inserted.length > 0">
+                    <button @click="changePage('inserted', currentPage.inserted - 1)"
+                            :disabled="currentPage.inserted === 1">이전</button>
+                    <span>{{ currentPage.inserted }} / {{ totalPages.inserted }}</span>
+                    <button @click="changePage('inserted', currentPage.inserted + 1)"
+                            :disabled="currentPage.inserted === totalPages.inserted">다음</button>
+                </div>
+                <ul class="packet-list">
+                    <li v-for="packet in paginatedItems.inserted" :key="packet.id">
+                        패킷 #{{ packet.id }}: <span class="proto">{{ packet.protocol }}</span>,
+                        길이: {{ packet.length }}, 시간: {{ packet.timestamp }}
+                        info: {{ packet.info }}
+                    </li>
+                </ul>
+            </div>
+        </div>
+
+        <div class="accordion result-section">
+            <div class="accordion-header" @click="toggleSection('duplicated')">
+                <h3>중복 발견된 패킷 ({{ results.duplicated.length }}개)</h3>
+                <span class="accordion-icon">{{ sectionOpen.duplicated ? '▼' : '▶' }}</span>
+            </div>
+            <div class="accordion-content" v-if="sectionOpen.duplicated">
+                <div class="pagination-controls" v-if="results.duplicated.length > 0">
+                    <button @click="changePage('duplicated', currentPage.duplicated - 1)"
+                            :disabled="currentPage.duplicated === 1">이전</button>
+                    <span>{{ currentPage.duplicated }} / {{ totalPages.duplicated }}</span>
+                    <button @click="changePage('duplicated', currentPage.duplicated + 1)"
+                            :disabled="currentPage.duplicated === totalPages.duplicated">다음</button>
+                </div>
+                <ul class="packet-list">
+                    <li v-for="item in paginatedItems.duplicated" :key="item.hash">
+                        패킷 해시: <code>{{ item.hash.substring(0, 16) }}...</code>,
+                        info: {{ item.info }},
+                        A에서 {{ item.countA }}회, B에서 {{ item.countB }}회 발견
+                    </li>
+                </ul>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    const { createApp } = Vue
+
+    const app = createApp({
+        data() {
+            return {
+                fileA: null,
+                fileB: null,
+                analyzing: false,
+                results: null,
+                error: null,
+                wasm: null,
+                sectionOpen: {
+                    dropped: true,
+                    inserted: true,
+                    duplicated: true
+                },
+                currentPage: {
+                    dropped: 1,
+                    inserted: 1,
+                    duplicated: 1
+                },
+                itemsPerPage: 100
+            }
+        },
+        computed: {
+            totalPages() {
+                if (!this.results) return { dropped: 0, inserted: 0, duplicated: 0 };
+
+                return {
+                    dropped: Math.ceil(this.results.dropped.length / this.itemsPerPage),
+                    inserted: Math.ceil(this.results.inserted.length / this.itemsPerPage),
+                    duplicated: Math.ceil(this.results.duplicated.length / this.itemsPerPage)
+                };
+            },
+            paginatedItems() {
+                if (!this.results) return { dropped: [], inserted: [], duplicated: [] };
+
+                const getPageItems = (items, page) => {
+                    const startIndex = (page - 1) * this.itemsPerPage;
+                    return items.slice(startIndex, startIndex + this.itemsPerPage);
+                };
+
+                return {
+                    dropped: getPageItems(this.results.dropped, this.currentPage.dropped),
+                    inserted: getPageItems(this.results.inserted, this.currentPage.inserted),
+                    duplicated: getPageItems(this.results.duplicated, this.currentPage.duplicated)
+                };
+            }
+        },
+        mounted() {
+            const go = new Go();
+            WebAssembly.instantiate(Base64Binary.decode(window.WASM_CODE), go.importObject).then((result) => {
+                this.wasm = result.instance;
+                go.run(this.wasm);
+            }).catch(err => {
+                this.error = '웹어셈블리 초기화 중 오류 발생: ' + err.message;
+            });
+        },
+        methods: {
+            handleFileAChange(event) {
+                this.fileA = event.target.files[0];
+                this.error = null;
+            },
+            handleFileBChange(event) {
+                this.fileB = event.target.files[0];
+                this.error = null;
+            },
+            async analyzePcaps() {
+                if (!this.fileA || !this.fileB) {
+                    this.error = '두 PCAP 파일을 모두 선택해주세요.';
+                    return;
+                }
+
+                this.analyzing = true;
+                this.error = null;
+                this.results = null;
+
+                try {
+                    const fileAArrayBuffer = await this.fileA.arrayBuffer();
+                    const fileBArrayBuffer = await this.fileB.arrayBuffer();
+
+                    const fileABytes = new Uint8Array(fileAArrayBuffer);
+                    const fileBBytes = new Uint8Array(fileBArrayBuffer);
+
+                    const result = analyzePcapFiles(fileABytes, fileBBytes);
+                    if (result.startsWith('{')) {
+                        this.results = JSON.parse(result);
+                        // 결과가 로드되면 페이지를 1로 초기화
+                        this.currentPage = {
+                            dropped: 1,
+                            inserted: 1,
+                            duplicated: 1
+                        };
+                    } else {
+                        this.error = '분석 중 오류 발생: ' + result;
+                    }
+                } catch (e) {
+                    this.error = '분석 중 오류 발생: ' + e.message;
+                    console.error(e);
+                } finally {
+                    this.analyzing = false;
+                }
+            },
+            toggleSection(section) {
+                this.sectionOpen[section] = !this.sectionOpen[section];
+            },
+            changePage(section, page) {
+                if (page >= 1 && page <= this.totalPages[section]) {
+                    this.currentPage[section] = page;
+                }
+            }
+        }
+    })
+
+    app.mount('#app')
+</script>
+
+<style>
+    .error-message {
+        background-color: #ffebee;
+        color: #c62828;
+        padding: 1rem;
+        margin: 1rem 0;
+        border-radius: 4px;
+        border: 1px solid #ef9a9a;
+    }
+
+    .accordion {
+        margin-bottom: 1rem;
+        border: 1px solid #ddd;
+        border-radius: 4px;
+        overflow: hidden;
+    }
+
+    .accordion-header {
+        padding: 0.5rem 1rem;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        background-color: #f5f5f5;
+        cursor: pointer;
+        user-select: none;
+    }
+
+    .accordion-header:hover {
+        background-color: #ececec;
+    }
+
+    .accordion-content {
+        padding: 1rem;
+        border-top: 1px solid #ddd;
+    }
+
+    .accordion-icon {
+        font-size: 1rem;
+    }
+
+    .pagination-controls {
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        margin-bottom: 1rem;
+        gap: 10px;
+    }
+
+    .pagination-controls button {
+        padding: 5px 10px;
+        background-color: #4CAF50;
+        color: white;
+        border: none;
+        border-radius: 4px;
+        cursor: pointer;
+    }
+
+    .pagination-controls button:disabled {
+        background-color: #cccccc;
+        cursor: not-allowed;
+    }
+
+    .pagination-controls span {
+        margin: 0 10px;
+    }
+</style>
+</body>
+</html>
